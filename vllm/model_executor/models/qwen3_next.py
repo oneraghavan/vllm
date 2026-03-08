@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import threading
 from collections.abc import Iterable
 from itertools import islice
 
@@ -625,6 +626,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     _fla_kernels_warmed_up: bool = False
+    _warmup_lock: threading.Lock = threading.Lock()
 
     @classmethod
     def _warmup_fla_kernels(cls, layer: "Qwen3NextGatedDeltaNet") -> None:
@@ -639,43 +641,50 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         This class method forces one execution with minimal tensors so
         autotuning happens while memory is still plentiful. It only runs
         once across all layers since they share the same autotune key values.
+
+        Uses double-checked locking to be thread-safe in case multiple
+        LLMEngine instances initialize concurrently.
         """
         if cls._fla_kernels_warmed_up:
             return
-        cls._fla_kernels_warmed_up = True
 
-        H_k = layer.num_k_heads // layer.tp_size
-        H_v = layer.num_v_heads // layer.tp_size
-        K = layer.head_k_dim
-        V = layer.head_v_dim
-        T = 128
-        N = 1
-        device = next(layer.parameters()).device
-        dtype = next(layer.parameters()).dtype
-        if dtype == torch.float32:
-            dtype = torch.bfloat16
+        with cls._warmup_lock:
+            if cls._fla_kernels_warmed_up:
+                return
+            cls._fla_kernels_warmed_up = True
 
-        q = torch.randn(1, T, H_k, K, dtype=dtype, device=device)
-        k = torch.randn(1, T, H_k, K, dtype=dtype, device=device)
-        v = torch.randn(1, T, H_v, V, dtype=dtype, device=device)
-        g = torch.randn(1, T, H_v, dtype=dtype, device=device)
-        beta = torch.rand(1, T, H_v, dtype=dtype, device=device).sigmoid()
-        initial_state = torch.zeros(N, H_v, V, K, dtype=dtype, device=device)
-        cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
+            H_k = layer.num_k_heads // layer.tp_size
+            H_v = layer.num_v_heads // layer.tp_size
+            K = layer.head_k_dim
+            V = layer.head_v_dim
+            T = 128
+            N = 1
+            device = next(layer.parameters()).device
+            dtype = next(layer.parameters()).dtype
+            if dtype == torch.float32:
+                dtype = torch.bfloat16
 
-        fla_chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=True,
-        )
+            q = torch.randn(1, T, H_k, K, dtype=dtype, device=device)
+            k = torch.randn(1, T, H_k, K, dtype=dtype, device=device)
+            v = torch.randn(1, T, H_v, V, dtype=dtype, device=device)
+            g = torch.randn(1, T, H_v, dtype=dtype, device=device)
+            beta = torch.rand(1, T, H_v, dtype=dtype, device=device).sigmoid()
+            initial_state = torch.zeros(N, H_v, V, K, dtype=dtype, device=device)
+            cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
 
-        del q, k, v, g, beta, initial_state, cu_seqlens
+            fla_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+            del q, k, v, g, beta, initial_state, cu_seqlens
 
     def _forward_core(
         self,

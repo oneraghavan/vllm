@@ -11,6 +11,7 @@ Validates that:
    under memory pressure succeed (the core bug scenario).
 """
 
+import threading
 from unittest import mock
 
 import pytest
@@ -121,6 +122,26 @@ class TestWarmupFlagManagement:
             Qwen3NextGatedDeltaNet._warmup_fla_kernels(layer)
             Qwen3NextGatedDeltaNet._warmup_fla_kernels(layer)
             Qwen3NextGatedDeltaNet._warmup_fla_kernels(layer)
+            assert mock_fla.call_count == 1
+
+    def test_warmup_thread_safe(self):
+        """Concurrent calls from multiple threads must still invoke
+        fla_chunk_gated_delta_rule exactly once (double-checked locking)."""
+        with mock.patch(
+            "vllm.model_executor.models.qwen3_next.fla_chunk_gated_delta_rule"
+        ) as mock_fla:
+            barrier = threading.Barrier(8)
+
+            def _call():
+                barrier.wait()
+                Qwen3NextGatedDeltaNet._warmup_fla_kernels(_make_mock_layer())
+
+            threads = [threading.Thread(target=_call) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
             assert mock_fla.call_count == 1
 
     def test_warmup_passes_correct_shapes(self):
