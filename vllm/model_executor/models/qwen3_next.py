@@ -624,6 +624,59 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
+    _fla_kernels_warmed_up: bool = False
+
+    @classmethod
+    def _warmup_fla_kernels(cls, layer: "Qwen3NextGatedDeltaNet") -> None:
+        """Warm up FLA Triton kernels by running them with small dummy inputs.
+
+        During vLLM's profile_run, attn_metadata is None so _forward_core
+        returns early and the FLA Triton kernels never execute. Since these
+        kernels use @triton.autotune, their first invocation triggers
+        benchmarking of all configurations. If that first invocation happens
+        after the KV cache has consumed most GPU memory, the autotuner OOMs.
+
+        This class method forces one execution with minimal tensors so
+        autotuning happens while memory is still plentiful. It only runs
+        once across all layers since they share the same autotune key values.
+        """
+        if cls._fla_kernels_warmed_up:
+            return
+        cls._fla_kernels_warmed_up = True
+
+        H_k = layer.num_k_heads // layer.tp_size
+        H_v = layer.num_v_heads // layer.tp_size
+        K = layer.head_k_dim
+        V = layer.head_v_dim
+        T = 128
+        N = 1
+        device = next(layer.parameters()).device
+        dtype = next(layer.parameters()).dtype
+        if dtype == torch.float32:
+            dtype = torch.bfloat16
+
+        q = torch.randn(1, T, H_k, K, dtype=dtype, device=device)
+        k = torch.randn(1, T, H_k, K, dtype=dtype, device=device)
+        v = torch.randn(1, T, H_v, V, dtype=dtype, device=device)
+        g = torch.randn(1, T, H_v, dtype=dtype, device=device)
+        beta = torch.rand(1, T, H_v, dtype=dtype, device=device).sigmoid()
+        initial_state = torch.zeros(N, H_v, V, K, dtype=dtype, device=device)
+        cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
+
+        fla_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        del q, k, v, g, beta, initial_state, cu_seqlens
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -638,7 +691,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profile run
+            # V1 profile run: trigger FLA kernel autotuning now while
+            # GPU memory is abundant (before KV cache allocation).
+            Qwen3NextGatedDeltaNet._warmup_fla_kernels(self)
             return
 
         assert isinstance(attn_metadata, dict)
